@@ -1,0 +1,283 @@
+// 1. IMPORT SEMUA DEPENDENSI
+require("dotenv").config();
+const mysql = require("mysql2/promise");
+const express = require("express");
+const path = require("path");
+const crypto = require("crypto");
+const bcrypt = require("bcrypt");
+const jwt = require("jsonwebtoken");
+
+// 2. SETUP APLIKASI EXPRESS
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+// 3. MIDDLEWARE
+app.use(express.json());
+app.use(express.static("public"));
+
+// 4. KONEKSI DATABASE (MYSQL POOL)
+const pool = mysql.createPool({
+  host: process.env.DB_HOST,
+  user: process.env.DB_USER,
+  password: process.env.DB_PASSWORD,
+  database: process.env.DB_NAME,
+  port: process.env.DB_PORT,
+  waitForConnections: true,
+  connectionLimit: 10,
+  queueLimit: 0,
+});
+
+const KEY_PREFIX = "Olip_j1p4_";
+const JWT_SECRET = process.env.JWT_SECRET;
+
+// ===============================================
+// RUTE PUBLIK & REGISTRASI USER
+// ===============================================
+
+// [GET] Generate API Key baru (belum terhubung ke user)
+app.get("/generate-apikey", async (req, res) => {
+  try {
+    const randomToken = crypto.randomBytes(16).toString("hex");
+    const newApiKey = KEY_PREFIX + randomToken;
+
+    const sql = "INSERT INTO api_keys (api_key) VALUES (?)";
+    await pool.query(sql, [newApiKey]);
+
+    console.log("Key baru dibuat (belum terhubung ke user):", newApiKey);
+    res.json({ apiKey: newApiKey });
+  } catch (error) {
+    console.error("Error saat generate key:", error);
+    res.status(500).json({ error: "Gagal membuat API key" });
+  }
+});
+
+// [POST] Mendaftarkan user baru dan menghubungkan API key
+app.post("/api/register", async (req, res) => {
+  const { firstname, lastname, email, apiKey } = req.body;
+
+  if (!firstname || !lastname || !email || !apiKey) {
+    return res.status(400).json({
+      error: "Semua field (firstname, lastname, email, apiKey) dibutuhkan.",
+    });
+  }
+
+  let connection;
+  try {
+    connection = await pool.getConnection();
+    await connection.beginTransaction();
+
+    const [keyRows] = await connection.query(
+      "SELECT * FROM api_keys WHERE api_key = ? AND user_id IS NULL",
+      [apiKey]
+    );
+
+    if (keyRows.length === 0) {
+      await connection.rollback();
+      return res.status(404).json({
+        error: "API Key tidak valid, sudah digunakan, atau tidak ditemukan.",
+      });
+    }
+
+    const userSql =
+      "INSERT INTO users (firstname, lastname, email, start_date) VALUES (?, ?, ?, CURDATE())";
+    const [userResult] = await connection.query(userSql, [
+      firstname,
+      lastname,
+      email,
+    ]);
+    const newUserId = userResult.insertId;
+
+    const apiKeyId = keyRows[0].id;
+    const updateKeySql = "UPDATE api_keys SET user_id = ? WHERE id = ?";
+    await connection.query(updateKeySql, [newUserId, apiKeyId]);
+
+    await connection.commit();
+
+    res.status(201).json({
+      message: "User berhasil dibuat dan API Key terhubung!",
+      user: { id: newUserId, firstname, lastname, email },
+      apiKey: apiKey,
+    });
+  } catch (error) {
+    if (connection) await connection.rollback();
+
+    if (error.code === "ER_DUP_ENTRY") {
+      res.status(409).json({ error: "Email sudah terdaftar." });
+    } else {
+      console.error("Error saat registrasi:", error);
+      res.status(500).json({ error: "Gagal mendaftar user" });
+    }
+  } finally {
+    if (connection) connection.release();
+  }
+});
+
+// ===============================================
+// RUTE ADMIN (PEMBUATAN & LOGIN)
+// ===============================================
+
+// [POST] Membuat admin baru
+app.post("/api/admin/register", async (req, res) => {
+  const { email, password } = req.body;
+  if (!email || !password) {
+    return res.status(400).json({ error: "Email dan password dibutuhkan" });
+  }
+
+  try {
+    // Hash password dengan bcrypt
+    const hashedPassword = await bcrypt.hash(password, 10);
+
+    const sql = "INSERT INTO admins (email, password) VALUES (?, ?)";
+    await pool.query(sql, [email, hashedPassword]);
+
+    res.status(201).json({ message: "Admin berhasil dibuat" });
+  } catch (error) {
+    if (error.code === "ER_DUP_ENTRY") {
+      res.status(409).json({ error: "Email admin sudah ada." });
+    } else {
+      console.error("Error buat admin:", error);
+      res.status(500).json({ error: "Gagal membuat admin" });
+    }
+  }
+});
+
+// [POST] Login admin
+app.post("/api/admin/login", async (req, res) => {
+  const { email, password } = req.body;
+  if (!email || !password) {
+    return res.status(400).json({ error: "Email dan password dibutuhkan" });
+  }
+
+  try {
+    const sql = "SELECT * FROM admins WHERE email = ?";
+    const [adminRows] = await pool.query(sql, [email]);
+
+    if (adminRows.length === 0) {
+      return res.status(401).json({ error: "Email atau password salah" });
+    }
+
+    const admin = adminRows[0];
+
+    const isMatch = await bcrypt.compare(password, admin.password);
+
+    if (!isMatch) {
+      return res.status(401).json({ error: "Email atau password salah" });
+    }
+
+    const token = jwt.sign(
+      { id: admin.id, email: admin.email, role: "admin" },
+      JWT_SECRET,
+      { expiresIn: "1h" }
+    );
+
+    res.json({ message: "Login berhasil", token: token });
+  } catch (error) {
+    console.error("Error login admin:", error);
+    res.status(500).json({ error: "Gagal login" });
+  }
+});
+
+// ===============================================
+// MIDDLEWARE OTENTIKASI ADMIN
+// ===============================================
+
+const authenticateAdmin = (req, res, next) => {
+  const authHeader = req.headers["authorization"];
+  const token = authHeader && authHeader.split(" ")[1]; // Format: "Bearer <token>"
+
+  if (token == null) {
+    return res
+      .status(401)
+      .json({ error: "Token tidak ada, otorisasi ditolak" });
+  }
+
+  jwt.verify(token, JWT_SECRET, (err, user) => {
+    if (err) {
+      return res.status(403).json({ error: "Token tidak valid" });
+    }
+    req.user = user;
+    next();
+  });
+};
+
+// ===============================================
+// RUTE ADMIN (TERPROTEKSI)
+// ===============================================
+
+// [GET]
+app.get("/api/admin/users", authenticateAdmin, async (req, res) => {
+  try {
+    const [users] = await pool.query(
+      "SELECT id, firstname, lastname, email, start_date, last_date FROM users ORDER BY created_at DESC"
+    );
+    res.json(users);
+  } catch (error) {
+    console.error("Error get users:", error);
+    res.status(500).json({ error: "Gagal mengambil data user" });
+  }
+});
+
+app.get("/api/admin/users", authenticateAdmin, async (req, res) => {
+  try {
+    const [users] = await pool.query(
+      "SELECT id, firstname, lastname, email, start_date, last_date FROM users ORDER BY created_at DESC"
+    );
+
+    const [keys] = await pool.query(
+      "SELECT id, api_key, user_id, status FROM api_keys"
+    );
+
+    const usersWithKeys = users.map((user) => {
+      const userKeys = keys
+        .filter((key) => key.user_id === user.id)
+        .map((key) => ({
+          key_id: key.id,
+          api_key: key.api_key,
+          status: key.status,
+        }));
+
+      return {
+        ...user,
+        api_keys: userKeys,
+      };
+    });
+
+    res.json(usersWithKeys);
+  } catch (error) {
+    console.error("Error get users:", error);
+    res.status(500).json({ error: "Gagal mengambil data user" });
+  }
+});
+
+app.post("/validate-apikey", async (req, res) => {
+  try {
+    const { apiKeyToValidate } = req.body;
+    if (!apiKeyToValidate) {
+      return res.status(400).json({ error: "API key dibutuhkan" });
+    }
+    // Cek key yang statusnya 'active'
+    const sql =
+      "SELECT COUNT(*) as count FROM api_keys WHERE api_key = ? AND status = 'active'";
+    const [rows] = await pool.query(sql, [apiKeyToValidate]);
+    const count = rows[0].count;
+    if (count > 0) {
+      res.json({ valid: true, message: "API Key sudah Valid" });
+    } else {
+      res.status(401).json({
+        valid: false,
+        message: "API Key Tidak Valid, Tidak Ditemukan, atau Inactive",
+      });
+    }
+  } catch (error) {
+    console.error("Error saat validasi key:", error);
+    res.status(500).json({ error: "Gagal memvalidasi key" });
+  }
+});
+
+// ===============================================
+// 6. SERVER LISTENER
+// ===============================================
+app.listen(PORT, () => {
+  console.log(`Server berjalan di http://localhost:${PORT}`);
+  console.log(`Terhubung ke database MySQL '${process.env.DB_NAME}'`);
+});
